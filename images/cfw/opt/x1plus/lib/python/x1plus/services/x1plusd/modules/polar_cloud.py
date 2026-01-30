@@ -581,7 +581,7 @@ class PolarPrintService(X1PlusDBusService):
         """
         prev_status = self.status
         task_state = self.daemon.mqtt.latest_print_status.get("gcode_state", "IDLE")
-        # task_stage = self.daemon.mqtt.latest_print_status.get("mc_print_stage", "0")
+        mc_print_stage = self.daemon.mqtt.latest_print_status.get("mc_print_stage", 0)
         # logger.debug(f"Polar  *** job id: {self.job_id}, status: {task_state}")
         logger.info(
             f"Polar prev status: {self.status}; "
@@ -590,6 +590,12 @@ class PolarPrintService(X1PlusDBusService):
         )
         # Note we don't change self.status until after we've determined the printer
         # state because we're tracking the previous status.
+
+        # Check for filament changing (mc_print_stage == 1 while IDLE)
+        if task_state == "IDLE" and mc_print_stage == 1:
+            self.status = 10  # Changing filament
+            return
+
         match self.STATE_TO_POLAR_STATUS[task_state]:
             case 0: # IDLE
                 if self.status != 0:
@@ -598,7 +604,7 @@ class PolarPrintService(X1PlusDBusService):
                         f"task_state: {task_state}"
                     )
                     await self._job("completed")
-                self.status == 0
+                self.status = 0
             case 1 | 2 | 3: # SLICING, PREPARING, RUNNING
                 # Printing or preparing
                 if self.job_id in {"0", "123"}:
@@ -732,7 +738,40 @@ class PolarPrintService(X1PlusDBusService):
                     "Percent Complete: "
                     f"{self.daemon.mqtt.latest_print_status.get('mc_percent', 0)}%"
                 ),
+                "door": 0,  # X1 Plus doesn't have a door sensor
             }
+            
+            # Add AMS information if available (format matching Polar Cloud expectations)
+            ams_data = self.daemon.mqtt.latest_print_status.get("ams", {})
+            ams_units = ams_data.get("ams", [])
+            if ams_units:
+                ams_list = []
+                for ams_unit in ams_units:
+                    tray_list = []
+                    for tray in ams_unit.get("tray", []):
+                        # Only include trays that have a filament type
+                        if not tray.get("tray_type"):
+                            continue
+                        tray_list.append({
+                            "id": tray.get("id", "0"),
+                            "tag_uid": tray.get("tag_uid", "0000000000000000"),
+                            "tray_info_idx": tray.get("tray_info_idx", ""),
+                            "tray_type": tray.get("tray_type", ""),
+                            "tray_sub_brands": tray.get("tray_sub_brands", ""),
+                            "tray_color": tray.get("tray_color", "000000FF"),
+                        })
+
+                    if tray_list:
+                        ams_list.append({
+                            "id": ams_unit.get("id", "0"),
+                            "humidity": ams_unit.get("humidity", "0"),
+                            "temp": ams_unit.get("temp", "0.0"),
+                            "tray": tray_list,
+                            "info": "",
+                        })
+
+                if ams_list:
+                    data["ams"] = ams_list
             try:
                 await self.socket.emit("status", data)
                 # logger.info(
@@ -747,7 +786,7 @@ class PolarPrintService(X1PlusDBusService):
                         cam = AioRtspReceiver()
                         jpeg = await cam.receive_jpeg()
 
-                        if self.status in [0, 8, 9, 10, 15]:
+                        if self.status in [0, 1, 8, 9, 10, 15]:
                             # In these cases send idle image.
                             # (TODO: are these all the cases for idle?)
                             await self._upload_jpeg("idle", jpeg)
@@ -770,7 +809,7 @@ class PolarPrintService(X1PlusDBusService):
                     logger.info("reconnecting to attempt to recover connected namespaces")
                     await self._force_reconnect()
                     return  # Or else we'll starting sending too many updates.
-            if self.status != "0":
+            if self.status != 0:
                 await asyncio.sleep(10)
             else:
                 # Longer pause when idle.
@@ -854,29 +893,76 @@ class PolarPrintService(X1PlusDBusService):
     async def _on_print(self, data, *args, **kwargs):
         """Download file to printer, then send to print."""
         logger.info("Polar _on_print")
-        self.job_id = data["jobId"]
-        if data.get("serialNumber", None) != self.creds.polar_sn:
+        logger.info(f"Polar print incoming data: {data}")
+
+        # Handle both field naming conventions (jobId/job_id, jobName/job_name, etc.)
+        self.job_id = data.get("jobId") or data.get("job_id")
+        serial = data.get("serialNumber") or data.get("serial_number")
+
+        if serial != self.creds.polar_sn:
             logger.debug("Polar serial numbers don't match.")
             await self._job("canceled")
             return
         # TODO: add recovery here if still printing?
 
-        logger.info(f"Polar print incoming data: {data}")
         path = "/tmp/x1plus" if is_emulating() else "/sdcard"
-        # Get extension from url, then make sure the file name has the correct
-        # extension. If extension is missing print will fail.
-        self.file_name = data["jobName"]
-        extension = os.path.splitext(data["gcodeFile"])[1]
-        logger.info(f"Polar print file extension: {extension}")
-        printer_action = "gcode_file"
+
+        # Get file name from jobName or job_name
+        self.file_name = data.get("jobName") or data.get("job_name", "print")
+
+        # Determine the file URL - prefer 3mf, fall back to gcode
+        gcode_url = data.get("gcodeFile") or data.get("gcode_file")
+        threemf_url = data.get("threemfFile") or data.get("threemf_file")
+
+        if threemf_url:
+            file_url = threemf_url
+        elif gcode_url:
+            file_url = gcode_url
+        else:
+            logger.error("Polar _on_print: no gcode or 3mf file URL provided")
+            await self._job("canceled")
+            return
+
+        # Determine printer action based on file extension
+        extension = os.path.splitext(file_url)[1].lower()
         if extension == ".3mf":
             printer_action = "3mf_file"
-        # if not self.file_name.endswith(extension):
-        #     self.file_name += extension
-        await self._download_file(path, self.file_name, data["gcodeFile"])
+        else:
+            printer_action = "gcode_file"
+
+        # Ensure file name has the correct extension
+        if not self.file_name.lower().endswith(extension):
+            self.file_name += extension
+
+        logger.info(f"Polar print file: {file_url}, extension: {extension}, action: {printer_action}, filename: {self.file_name}")
+
+        await self._download_file(path, self.file_name, file_url)
         location = os.path.join(path, self.file_name)
         self.start_time = datetime.datetime.now()
-        await self._printer_action(printer_action, location)
+
+        # Handle AMS mapping from print_options.ams_tray, ams.ams_tray, or direct ams_tray
+        ams_mapping = []
+        print_options = data.get("print_options", {})
+        ams_obj = data.get("ams", {})
+        ams_tray_list = (
+            print_options.get("ams_tray") or
+            ams_obj.get("ams_tray") or
+            data.get("ams_tray")
+        )
+
+        if ams_tray_list and isinstance(ams_tray_list, list):
+            # Extract the tray IDs to form the mapping list
+            # The printer expects a list of tray IDs (integers) corresponding to the filament slots in the sliced file
+            try:
+                for tray in ams_tray_list:
+                    # We expect 'id' to be the tray ID (e.g., "0", "1", etc.)
+                    if "id" in tray:
+                        ams_mapping.append(int(tray["id"]))
+                logger.info(f"Polar AMS mapping: {ams_mapping}")
+            except Exception as e:
+                logger.error(f"Failed to parse ams_tray for mapping: {e}")
+
+        await self._printer_action(printer_action, location, ams_mapping=ams_mapping)
 
     async def _download_file(self, path, file_name, url):
         """
@@ -976,13 +1062,20 @@ class PolarPrintService(X1PlusDBusService):
         }
         await self.socket.emit("getUrl", request_data)
 
-    async def _printer_action(self, which_action, print_file="") -> None:
+    async def _printer_action(self, which_action, print_file="", ams_mapping=None) -> None:
         """
         Make dbus call to print, pause, cancel, resume. If printing a 3mf file
         we need the print_file name and the plate to print.
         """
-        logger.info(f"Polar _printer_action {which_action} {print_file}")
+        logger.info(f"Polar _printer_action {which_action} {print_file} ams_mapping={ams_mapping}")
         request_json = {}
+        
+        # Default AMS mapping to empty list if None
+        if ams_mapping is None:
+            ams_mapping = []
+            
+        use_ams = len(ams_mapping) > 0
+        
         if which_action == "3mf_file":
             request_json = {
                 "print": {
@@ -1002,8 +1095,18 @@ class PolarPrintService(X1PlusDBusService):
                     "flow_cali": True,
                     "vibration_cali": True,
                     "layer_inspect": True,
-                    "ams_mapping": "",
-                    "use_ams": False,
+                    "ams_mapping": ams_mapping,
+                    "use_ams": use_ams,
+                }
+            }
+        elif which_action == "gcode_file":
+             request_json = {
+                "print": {
+                    "sequence_id": "0",
+                    "command": "gcode_file",
+                    "param": f"{print_file}",
+                    "ams_mapping": ams_mapping,
+                    "use_ams": use_ams,
                 }
             }
         else:
